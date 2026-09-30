@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 
 if [ "$#" -lt 2 ]; then
     echo "usage: $0 /path/to/ergo-x.y.z.jar <doctor-command> [options...]" >&2
