@@ -209,10 +209,15 @@ object ErgoHistoryDoctor {
       Files.isDirectory(historyDir),
       s"History directory does not exist: $historyDir. Refusing to create a new history database; check the node directory/config."
     )
-    require(
-      Files.isRegularFile(historyDir.resolve("CURRENT")),
-      s"Existing Ergo LevelDB was not found at $historyDir (missing CURRENT). Refusing to create/open a new history database."
-    )
+    val requiredStores = Seq("index", "objects", "extra")
+    requiredStores.foreach { storeName =>
+      val storeDir = historyDir.resolve(storeName)
+      require(
+        Files.isDirectory(storeDir) && Files.isRegularFile(storeDir.resolve("CURRENT")),
+        s"Existing Ergo LevelDB store was not found at $storeDir (missing directory or CURRENT). " +
+          "Refusing to create/open a new history database."
+      )
+    }
 
     val storage = HistoryStorage(ergoSettings)
 
