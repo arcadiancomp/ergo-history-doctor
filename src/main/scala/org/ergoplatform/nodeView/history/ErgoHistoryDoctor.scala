@@ -200,6 +200,20 @@ object ErgoHistoryDoctor {
   private def open(config: Path, network: String): Opened = {
     val nt = NetworkType.fromString(network).getOrElse(fail(s"Unsupported network: $network"))
     val ergoSettings = ErgoSettingsReader.read(Args(Some(config.toAbsolutePath.toString), Some(nt)))
+
+    // HistoryStorage/ErgoHistory.historyDir will create a missing history directory.
+    // A diagnostic tool must never silently create a new empty database because the
+    // working directory or config path was wrong. Require an existing LevelDB first.
+    val historyDir = Paths.get(ergoSettings.directory, "history").toAbsolutePath.normalize
+    require(
+      Files.isDirectory(historyDir),
+      s"History directory does not exist: $historyDir. Refusing to create a new history database; check the node directory/config."
+    )
+    require(
+      Files.isRegularFile(historyDir.resolve("CURRENT")),
+      s"Existing Ergo LevelDB was not found at $historyDir (missing CURRENT). Refusing to create/open a new history database."
+    )
+
     val storage = HistoryStorage(ergoSettings)
 
     val history: ErgoHistory =
