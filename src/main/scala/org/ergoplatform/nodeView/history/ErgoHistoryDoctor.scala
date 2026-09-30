@@ -297,7 +297,7 @@ object ErgoHistoryDoctor {
       s"height=$height is outside 1..${o.history.headersHeight}")
 
     inspectHeight(o, height) match {
-      case Some(state) => printHeightState(state)
+      case Some(state) => printHeightState(state, o.history.fullBlockHeight)
       case None =>
         println(s"height=$height canonical header cannot be resolved from raw history")
         println(s"bestHeaderIdAtHeight=${o.history.bestHeaderIdAtHeight(height).getOrElse("-")}")
@@ -311,8 +311,9 @@ object ErgoHistoryDoctor {
     readOnlyFooter()
   }
 
-  private def printHeightState(s: HeightState): Unit = {
+  private def printHeightState(s: HeightState, fullBlockHeight: Int): Unit = {
     println(s"height=${s.height}")
+    println(s"scope=${heightScope(fullBlockHeight, s.height)} fullBlockHeight=$fullBlockHeight")
     println(
       s"HEADER id=${s.headerId} validity=${s.headerValidity} raw=${bool(s.headerRawPresent)} " +
         s"rawParse=${bool(s.headerRawParseable)} parentCanonical=${bool(s.parentMatchesCanonical)}"
@@ -350,6 +351,8 @@ object ErgoHistoryDoctor {
     println(s"headersHeight   = ${h.headersHeight}")
     println(s"fullBlockHeight = ${h.fullBlockHeight}")
     println(s"scan range      = $from..$to")
+    println("scope HISTORICAL_APPLIED_REPORT_ONLY = at/below fullBlockHeight; automatic repair is refused")
+    println("scope ACTIVE_GAP                     = above fullBlockHeight; may be eligible for repair planning")
     println()
 
     val counts = mutable.Map.empty[String, Long].withDefaultValue(0L)
@@ -363,7 +366,7 @@ object ErgoHistoryDoctor {
     }
 
     tsv.foreach(_.println(
-      "height\theaderId\theaderValidity\theaderRaw\theaderParse\tparentCanonical\t" +
+      "height\tscope\theaderId\theaderValidity\theaderRaw\theaderParse\tparentCanonical\t" +
         "txClass\ttxValidity\ttxRaw\ttxParse\t" +
         "adClass\tadValidity\tadRaw\tadParse\t" +
         "extClass\textValidity\textRaw\textParse"
@@ -384,7 +387,8 @@ object ErgoHistoryDoctor {
         inspectHeight(o, height) match {
           case None =>
             counts("HEADER_UNRESOLVED") += 1
-            val sig = "HEADER_UNRESOLVED"
+            val scope = heightScope(h.fullBlockHeight, height)
+            val sig = s"SCOPE=$scope HEADER_UNRESOLVED"
             if (previousSig.exists(_ != sig)) {
               flushRun(previousHeight)
               runStart = height
@@ -392,7 +396,7 @@ object ErgoHistoryDoctor {
             previousSig = Some(sig)
             previousHeight = height
             tsv.foreach(_.println(
-              s"$height\t-\t-\t-\t-\t-\tHEADER_UNRESOLVED\t-\t-\t-\tHEADER_UNRESOLVED\t-\t-\t-\tHEADER_UNRESOLVED\t-\t-\t-"
+              s"$height\t$scope\t-\t-\t-\t-\t-\tHEADER_UNRESOLVED\t-\t-\t-\tHEADER_UNRESOLVED\t-\t-\t-\tHEADER_UNRESOLVED\t-\t-\t-"
             ))
 
           case Some(s) =>
@@ -400,7 +404,8 @@ object ErgoHistoryDoctor {
             counts(s"HEADER:${s.headerValidity}") += 1
             if (!s.parentMatchesCanonical) counts("HEADER:PARENT_MISMATCH") += 1
 
-            val sig = s.signature
+            val scope = heightScope(h.fullBlockHeight, s.height)
+            val sig = s"SCOPE=$scope ${s.signature}"
             if (previousSig.exists(_ != sig)) {
               flushRun(previousHeight)
               runStart = height
@@ -411,6 +416,7 @@ object ErgoHistoryDoctor {
             tsv.foreach { out =>
               out.println(Seq(
                 s.height,
+                scope,
                 s.headerId,
                 s.headerValidity,
                 bool(s.headerRawPresent),
@@ -1232,6 +1238,9 @@ object ErgoHistoryDoctor {
 
   private def hex(bytes: Array[Byte]): String =
     bytes.map(b => f"${b & 0xff}%02x").mkString
+
+  private def heightScope(fullBlockHeight: Int, height: Int): String =
+    if (height <= fullBlockHeight) "HISTORICAL_APPLIED_REPORT_ONLY" else "ACTIVE_GAP"
 
   private def bool(v: Boolean): String = if (v) "Y" else "-"
   private def emptyDash(s: String): String = if (s.isEmpty) "-" else s
