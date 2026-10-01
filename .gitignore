@@ -22,3 +22,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.iml
+
+# Ergo/logback runtime logs
+ergo.log
+ergo-*.log
+ergo-*.log.gz
