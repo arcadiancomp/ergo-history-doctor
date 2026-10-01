@@ -540,8 +540,7 @@ object ErgoHistoryDoctor {
     val out = cli.out.getOrElse(fail("plan requires --out <file>"))
 
     requireRange(from, to, h.headersHeight)
-    require(from > h.fullBlockHeight,
-      s"Refusing to plan repairs at or below best full block height ${h.fullBlockHeight}")
+    requireRepairStartAboveFullBlockHeight(h.fullBlockHeight, from)
 
     val allowedSections = cli.sections.map(_.toUpperCase)
     require(allowedSections.nonEmpty, "--sections must not be empty")
@@ -1239,7 +1238,13 @@ object ErgoHistoryDoctor {
   private def hex(bytes: Array[Byte]): String =
     bytes.map(b => f"${b & 0xff}%02x").mkString
 
-  private def heightScope(fullBlockHeight: Int, height: Int): String =
+  private[history] def requireRepairStartAboveFullBlockHeight(fullBlockHeight: Int, from: Int): Unit =
+    require(
+      from > fullBlockHeight,
+      s"Refusing to plan repairs at or below best full block height $fullBlockHeight"
+    )
+
+  private[history] def heightScope(fullBlockHeight: Int, height: Int): String =
     if (height <= fullBlockHeight) "HISTORICAL_APPLIED_REPORT_ONLY" else "ACTIVE_GAP"
 
   private def bool(v: Boolean): String = if (v) "Y" else "-"

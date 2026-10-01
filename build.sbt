@@ -36,3 +36,5 @@ scalacOptions ++= Seq(
   "-unchecked",
   "-target:jvm-1.8"
 )
+
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % Test
