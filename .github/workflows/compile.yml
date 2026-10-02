@@ -36,6 +36,7 @@ jobs:
           grep -Fq 'ErgoHistoryDoctorSafetySpec' "$RUNNER_TEMP/defined-tests.txt"
           grep -Fq 'ErgoHistoryDoctorHistoryLayoutSpec' "$RUNNER_TEMP/defined-tests.txt"
           grep -Fq 'ErgoHistoryDoctorLockSpec' "$RUNNER_TEMP/defined-tests.txt"
+          grep -Fq 'ErgoHistoryDoctorDiagnoseSpec' "$RUNNER_TEMP/defined-tests.txt"
           ./scripts/sbt.sh clean test
 
       - name: Package against Ergo 6.0.6

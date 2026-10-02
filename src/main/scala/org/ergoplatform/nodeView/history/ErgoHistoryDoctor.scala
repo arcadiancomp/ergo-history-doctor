@@ -34,7 +34,8 @@ import scala.util.{Failure, Success, Try}
   * It does not reimplement the LevelDB schema.
   *
   * Safety boundaries:
-  *   - the Ergo node MUST be stopped;
+  *   - preflight never opens LevelDB and may run while the Ergo node is active;
+  *   - commands that open history require exclusive LevelDB access;
   *   - the state DB is never opened;
   *   - headers are never automatically deleted or rewritten;
   *   - modifiers are never marked Valid;
@@ -53,6 +54,10 @@ object ErgoHistoryDoctor {
   private val ProgressEvery = 10000
   private val SupportedSections = Set("TX", "AD", "EXT")
   private val RequiredHistoryStores = Vector("index", "objects", "extra")
+  private val RoutineSectionClasses =
+    Set("PRESENT_VALID", "PRESENT_UNKNOWN", "CLEAN_MISSING")
+  private val HealthyPresentClasses =
+    Set("PRESENT_VALID", "PRESENT_UNKNOWN")
 
   final case class Cli(
       command: String,
@@ -72,6 +77,21 @@ object ErgoHistoryDoctor {
   private[history] final case class LockProbe(status: String, detail: String) {
     def isFree: Boolean = status == "FREE"
   }
+
+  private[history] final case class DiagnoseFacts(
+      gap: Int,
+      headerProblems: Long,
+      repairCandidates: Long,
+      unsupportedAnomalies: Long,
+      completeUnappliedHeights: Long
+  )
+
+  private[history] final case class DiagnoseSectionFacts(
+      classification: String,
+      validity: String,
+      rawPresent: Boolean,
+      rawParseable: Boolean
+  )
 
   final case class RuntimeIdentity(
       toolVersion: String,
@@ -173,6 +193,7 @@ object ErgoHistoryDoctor {
           withHistory(cli) { opened =>
             cli.command match {
               case "summary" => summary(opened)
+              case "diagnose" => diagnose(opened, cli)
               case "inspect" => inspect(opened, cli.height.getOrElse(fail("inspect requires --height")))
               case "scan" => scan(opened, cli)
               case "walk-gap" => walkGap(opened, cli.max.getOrElse(Int.MaxValue))
@@ -475,6 +496,306 @@ object ErgoHistoryDoctor {
     println(s"Ergo code source   = ${o.runtime.ergoCodeSource}")
     println(s"Ergo code SHA-256  = ${emptyDash(o.runtime.ergoCodeSha256)}")
     println(s"Ergo version hint  = ${emptyDash(o.runtime.ergoVersionHint)}")
+    println()
+    readOnlyFooter()
+  }
+
+  /**
+    * Single-pass triage of the active header/full-block gap.
+    *
+    * This command is read-only. It does not open state and does not create a
+    * repair plan. It summarizes what native Ergo history APIs report and points
+    * the operator toward a narrower next step.
+    */
+  private def diagnose(o: Opened, cli: Cli): Unit = {
+    val h = o.history
+    val gap = math.max(0, h.headersHeight - h.fullBlockHeight)
+
+    println("========================================")
+    println(s"ERGO HISTORY DOCTOR $ToolVersion - DIAGNOSE")
+    println("========================================")
+    println(s"Node directory       = ${normalizedNodeDirectory(o.settings)}")
+    println(s"Network              = ${o.settings.networkType.verboseName}")
+    println(s"headersHeight        = ${h.headersHeight}")
+    println(s"fullBlockHeight      = ${h.fullBlockHeight}")
+    println(s"gap                  = $gap")
+    println(s"bestHeaderId         = ${h.bestHeaderIdOpt.getOrElse("-")}")
+    println(s"bestFullBlockId      = ${h.bestFullBlockIdOpt.getOrElse("-")}")
+    println(s"Ergo version hint    = ${emptyDash(o.runtime.ergoVersionHint)}")
+    println(s"State database       = NOT OPENED")
+    println()
+
+    if (gap == 0) {
+      val facts = DiagnoseFacts(
+        gap = 0,
+        headerProblems = 0,
+        repairCandidates = 0,
+        unsupportedAnomalies = 0,
+        completeUnappliedHeights = 0
+      )
+
+      println(s"assessment           = ${diagnosisCode(facts)}")
+      println("No active header/full-block gap exists.")
+      println("There is no unapplied canonical range for diagnose to scan.")
+      println()
+      readOnlyFooter()
+      return
+    }
+
+    val from = h.fullBlockHeight + 1
+    val to = h.headersHeight
+
+    println(s"active range         = $from..$to")
+    println()
+
+    val sectionCounts =
+      mutable.Map.empty[(String, String), Long].withDefaultValue(0L)
+
+    val candidateCounts =
+      mutable.Map.empty[String, Long].withDefaultValue(0L)
+
+    val firstCandidate =
+      mutable.Map.empty[String, Int]
+
+    val lastCandidate =
+      mutable.Map.empty[String, Int]
+
+    var unresolvedHeaders = 0L
+    var invalidHeaders = 0L
+    var parentMismatches = 0L
+
+    var unsupportedAnomalies = 0L
+    var firstUnsupportedHeight: Option[Int] = None
+
+    var completeUnappliedHeights = 0L
+    var firstCompleteUnappliedHeight: Option[Int] = None
+
+    val boundaryMatches =
+      if (h.fullBlockHeight <= 0) true
+      else {
+        h.bestFullBlockIdOpt.nonEmpty &&
+          h.bestHeaderIdAtHeight(h.fullBlockHeight) == h.bestFullBlockIdOpt
+      }
+
+    var height = from
+
+    while (height <= to) {
+      if ((height - from) > 0 && (height - from) % ProgressEvery == 0) {
+        System.err.println(s"...diagnosed through height ${height - 1}")
+      }
+
+      inspectHeight(o, height) match {
+        case None =>
+          unresolvedHeaders += 1
+
+        case Some(state) =>
+          if (state.headerValidity == "Invalid") {
+            invalidHeaders += 1
+          }
+
+          if (!state.parentMatchesCanonical) {
+            parentMismatches += 1
+          }
+
+          val sections = Vector(state.tx, state.ad, state.ext)
+
+          sections.foreach { section =>
+            val key = section.section -> section.classification
+            sectionCounts(key) += 1
+
+            repairCandidateAction(section) match {
+              case Some(_) =>
+                candidateCounts(section.section) += 1
+
+                if (!firstCandidate.contains(section.section)) {
+                  firstCandidate(section.section) = height
+                }
+
+                lastCandidate(section.section) = height
+
+              case None =>
+                if (!RoutineSectionClasses.contains(section.classification)) {
+                  unsupportedAnomalies += 1
+
+                  if (firstUnsupportedHeight.isEmpty) {
+                    firstUnsupportedHeight = Some(height)
+                  }
+                }
+            }
+          }
+
+          val healthyLookingComplete =
+            sections.forall(s => HealthyPresentClasses.contains(s.classification))
+
+          if (healthyLookingComplete) {
+            completeUnappliedHeights += 1
+
+            if (firstCompleteUnappliedHeight.isEmpty) {
+              firstCompleteUnappliedHeight = Some(height)
+            }
+          }
+      }
+
+      height += 1
+    }
+
+    val boundaryProblems = if (boundaryMatches) 0L else 1L
+
+    val headerProblems =
+      boundaryProblems +
+        unresolvedHeaders +
+        invalidHeaders +
+        parentMismatches
+
+    val totalRepairCandidates =
+      candidateCounts.values.sum
+
+    val facts = DiagnoseFacts(
+      gap = gap,
+      headerProblems = headerProblems,
+      repairCandidates = totalRepairCandidates,
+      unsupportedAnomalies = unsupportedAnomalies,
+      completeUnappliedHeights = completeUnappliedHeights
+    )
+
+    val assessment = diagnosisCode(facts)
+
+    println("CANONICAL HEADER CHECKS")
+    println(s"full boundary matches = ${if (boundaryMatches) "YES" else "NO"}")
+    println(s"unresolved headers     = $unresolvedHeaders")
+    println(s"invalid headers        = $invalidHeaders")
+    println(s"parent mismatches      = $parentMismatches")
+    println()
+
+    println("SECTION CLASSIFICATIONS")
+
+    Seq("TX", "AD", "EXT").foreach { section =>
+      println(s"$section:")
+
+      val rows = sectionCounts.toSeq
+        .collect {
+          case ((s, classification), count) if s == section =>
+            classification -> count
+        }
+        .sortBy(_._1)
+
+      if (rows.isEmpty) {
+        println("  (none)")
+      } else {
+        rows.foreach { case (classification, count) =>
+          println(f"  $classification%-30s $count%d")
+        }
+      }
+    }
+
+    println()
+    println("AUTOMATIC REPAIR CANDIDATES")
+
+    Seq("TX", "AD", "EXT").foreach { section =>
+      val count = candidateCounts(section)
+
+      if (count > 0) {
+        println(
+          f"$section%-3s count=$count%d " +
+            s"first=${firstCandidate(section)} last=${lastCandidate(section)}"
+        )
+      } else {
+        println(f"$section%-3s count=0")
+      }
+    }
+
+    println(s"total candidate records = $totalRepairCandidates")
+    println()
+
+    println("DIAGNOSE-ONLY FINDINGS")
+    println(s"unsupported anomalies       = $unsupportedAnomalies")
+    println(s"complete/unapplied heights  = $completeUnappliedHeights")
+
+    firstUnsupportedHeight.foreach { x =>
+      println(s"first unsupported height    = $x")
+    }
+
+    firstCompleteUnappliedHeight.foreach { x =>
+      println(s"first complete/unapplied    = $x")
+    }
+
+    println()
+    println(s"assessment = $assessment")
+    println()
+
+    val config = cli.config.toAbsolutePath.normalize.toString
+
+    assessment match {
+      case "ACTIVE_GAP_WITH_HEADER_ANOMALIES" =>
+        println(
+          "The canonical/header path has a problem. Automatic header repair is unsupported."
+        )
+        println("Suggested next command:")
+        println(s"""  walk-gap --config "$config" --max ${gap + 1}""")
+
+      case "ACTIVE_GAP_WITH_MIXED_ANOMALIES" =>
+        println(
+          "The gap contains automatic repair candidates and diagnose-only anomalies."
+        )
+        println(
+          "Inspect the unsupported anomaly before creating a repair plan."
+        )
+        firstUnsupportedHeight.foreach { x =>
+          println("Suggested next command:")
+          println(s"""  inspect --config "$config" --height $x""")
+        }
+
+      case "ACTIVE_GAP_WITH_UNSUPPORTED_ANOMALIES" =>
+        println(
+          "The gap contains anomalous section states that EHD deliberately will not auto-repair."
+        )
+        firstUnsupportedHeight.foreach { x =>
+          println("Suggested next command:")
+          println(s"""  inspect --config "$config" --height $x""")
+        }
+
+      case "ACTIVE_GAP_WITH_REPAIR_CANDIDATES" =>
+        val sections = Seq("TX", "AD", "EXT")
+          .filter(s => candidateCounts(s) > 0)
+          .mkString(",")
+
+        println(
+          "The active gap contains mechanically repairable section states."
+        )
+        println("No repair has been performed.")
+        println("Suggested next command:")
+        println(
+          s"""  plan --config "$config" --from $from --to $to """ +
+            s"""--sections $sections --out repair-plan.tsv"""
+        )
+
+      case "ACTIVE_GAP_WITH_COMPLETE_UNAPPLIED_BLOCKS" =>
+        println(
+          "At least one height appears to have all expected sections present but remains above the full-block tip."
+        )
+        println(
+          "Healthy-looking complete-but-unapplied blocks are diagnose-only; EHD will not delete them automatically."
+        )
+        firstCompleteUnappliedHeight.foreach { x =>
+          println("Suggested next command:")
+          println(s"""  inspect --config "$config" --height $x""")
+        }
+
+      case "ACTIVE_GAP_WITHOUT_REPAIR_CANDIDATES" =>
+        println(
+          "The active gap contains no mechanical repair candidates detected by EHD."
+        )
+        println(
+          "Missing sections may simply need ordinary network synchronization."
+        )
+        println(
+          "Restart the node and observe whether the full-block height advances before considering repair."
+        )
+
+      case other =>
+        println(s"No next-step rule is defined for assessment $other.")
+    }
+
     println()
     readOnlyFooter()
   }
@@ -847,12 +1168,23 @@ object ErgoHistoryDoctor {
     *
     * We intentionally do NOT auto-repair a healthy-looking complete-but-unapplied block.
     */
-  private def repairCandidateAction(s: SectionState): Option[String] = {
-    if (s.validity == "Invalid") Some("CLEAR_INVALID_AND_DROP_RAW")
-    else if (s.rawPresent && !s.rawParseable) Some("DROP_CORRUPT_RAW_AND_CLEAR_VALIDITY")
-    else if (s.validity == "Valid" && !s.rawPresent) Some("CLEAR_ORPHAN_VALIDITY")
+  private[history] def repairCandidateActionFor(
+      validity: String,
+      rawPresent: Boolean,
+      rawParseable: Boolean
+  ): Option[String] = {
+    if (validity == "Invalid") Some("CLEAR_INVALID_AND_DROP_RAW")
+    else if (rawPresent && !rawParseable) Some("DROP_CORRUPT_RAW_AND_CLEAR_VALIDITY")
+    else if (validity == "Valid" && !rawPresent) Some("CLEAR_ORPHAN_VALIDITY")
     else None
   }
+
+  private[history] def repairCandidateAction(s: SectionState): Option[String] =
+    repairCandidateActionFor(
+      validity = s.validity,
+      rawPresent = s.rawPresent,
+      rawParseable = s.rawParseable
+    )
 
   private def repair(o: Opened, cli: Cli): Unit = {
     val planPath = cli.plan.getOrElse(fail("repair requires --plan <file>"))
@@ -1361,6 +1693,7 @@ object ErgoHistoryDoctor {
          |Commands:
          |  preflight --config ergo.conf [--network mainnet]
          |  summary   --config ergo.conf [--network mainnet]
+         |  diagnose  --config ergo.conf [--network mainnet]
          |  inspect   --config ergo.conf --height N
          |  scan      --config ergo.conf [--from N --to N] [--out report.tsv]
          |  walk-gap  --config ergo.conf [--max N]
@@ -1433,6 +1766,60 @@ object ErgoHistoryDoctor {
       from > fullBlockHeight,
       s"Refusing to plan repairs at or below best full block height $fullBlockHeight"
     )
+
+  private[history] def diagnoseSectionFacts(
+      tx: DiagnoseSectionFacts,
+      ad: DiagnoseSectionFacts,
+      ext: DiagnoseSectionFacts
+  ): DiagnoseFacts = {
+    val sections = Vector(tx, ad, ext)
+
+    val repairCandidates = sections.count { s =>
+      repairCandidateActionFor(
+        validity = s.validity,
+        rawPresent = s.rawPresent,
+        rawParseable = s.rawParseable
+      ).nonEmpty
+    }
+
+    val unsupported = sections.count { s =>
+      repairCandidateActionFor(
+        validity = s.validity,
+        rawPresent = s.rawPresent,
+        rawParseable = s.rawParseable
+      ).isEmpty &&
+        !RoutineSectionClasses.contains(s.classification)
+    }
+
+    val complete =
+      if (sections.forall(s => HealthyPresentClasses.contains(s.classification))) 1L
+      else 0L
+
+    DiagnoseFacts(
+      gap = 1,
+      headerProblems = 0,
+      repairCandidates = repairCandidates.toLong,
+      unsupportedAnomalies = unsupported.toLong,
+      completeUnappliedHeights = complete
+    )
+  }
+  private[history] def diagnosisCode(f: DiagnoseFacts): String = {
+    if (f.gap <= 0) {
+      "NO_ACTIVE_GAP"
+    } else if (f.headerProblems > 0) {
+      "ACTIVE_GAP_WITH_HEADER_ANOMALIES"
+    } else if (f.repairCandidates > 0 && f.unsupportedAnomalies > 0) {
+      "ACTIVE_GAP_WITH_MIXED_ANOMALIES"
+    } else if (f.unsupportedAnomalies > 0) {
+      "ACTIVE_GAP_WITH_UNSUPPORTED_ANOMALIES"
+    } else if (f.repairCandidates > 0) {
+      "ACTIVE_GAP_WITH_REPAIR_CANDIDATES"
+    } else if (f.completeUnappliedHeights > 0) {
+      "ACTIVE_GAP_WITH_COMPLETE_UNAPPLIED_BLOCKS"
+    } else {
+      "ACTIVE_GAP_WITHOUT_REPAIR_CANDIDATES"
+    }
+  }
 
   private[history] def heightScope(fullBlockHeight: Int, height: Int): String =
     if (height <= fullBlockHeight) "HISTORICAL_APPLIED_REPORT_ONLY" else "ACTIVE_GAP"

@@ -71,6 +71,7 @@ $conf = 'C:\ERGO\ergo.conf'
 .\scripts\doctor.ps1 -ErgoJar $jar preflight --config $conf
 
 # After offlineOpenAllowed=YES:
+.\scripts\doctor.ps1 -ErgoJar $jar diagnose --config $conf
 .\scripts\doctor.ps1 -ErgoJar $jar summary --config $conf
 .\scripts\doctor.ps1 -ErgoJar $jar walk-gap --config $conf
 .\scripts\doctor.ps1 -ErgoJar $jar scan --config $conf --out C:\ERGO\history-scan.tsv
@@ -95,6 +96,30 @@ Useful classifications include:
 | `VALID_BUT_MISSING_RAW` | validity says Valid but the raw object is absent |
 | `CLEAN_MISSING` | raw object and validity row are absent; semantic state is Absent |
 | `MALFORMED_VALIDITY_ROW` | a validity row exists but does not decode as Valid/Invalid |
+
+## Diagnose a stuck node
+
+With the node stopped and `preflight` reporting `offlineOpenAllowed=YES`:
+
+```powershell
+.\scripts\doctor.ps1 -ErgoJar $jar diagnose --config $conf
+```
+
+`diagnose` performs a single read-only pass over the active range from `fullBlockHeight + 1` through `headersHeight`. It checks canonical-header continuity and summarizes the native Ergo view of each referenced TX, AD and EXT section.
+
+It does **not** open the state database, create a repair plan, delete records or mark modifiers Valid.
+
+The assessment is intentionally conservative:
+
+- `NO_ACTIVE_GAP` — header and full-block heights are equal; historical rows are not scanned.
+- `ACTIVE_GAP_WITHOUT_REPAIR_CANDIDATES` — an active gap exists, but EHD found no mechanically repairable inconsistency; ordinary synchronization may still be sufficient.
+- `ACTIVE_GAP_WITH_REPAIR_CANDIDATES` — one or more block sections match the same narrow repair-candidate rules used by `plan`.
+- `ACTIVE_GAP_WITH_UNSUPPORTED_ANOMALIES` — anomalous history exists, but EHD deliberately will not auto-repair those states.
+- `ACTIVE_GAP_WITH_MIXED_ANOMALIES` — repairable and diagnose-only anomalies coexist; inspect the unsupported finding before planning.
+- `ACTIVE_GAP_WITH_COMPLETE_UNAPPLIED_BLOCKS` — expected sections appear present although the height remains above the full-block tip; these are diagnose-only.
+- `ACTIVE_GAP_WITH_HEADER_ANOMALIES` — canonical-header continuity, validity or the full-block boundary is abnormal; automatic header repair is unsupported.
+
+Missing block sections by themselves are not labeled corruption. A `CLEAN_MISSING` section may simply need to be downloaded normally by the node.
 
 ## Inspect one height
 
