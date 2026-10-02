@@ -34,6 +34,7 @@ jobs:
           test -f src/test/scala/org/ergoplatform/nodeView/history/ErgoHistoryDoctorSafetySpec.scala
           ./scripts/sbt.sh 'show Test / definedTests' | tee "$RUNNER_TEMP/defined-tests.txt"
           grep -Fq 'ErgoHistoryDoctorSafetySpec' "$RUNNER_TEMP/defined-tests.txt"
+          grep -Fq 'ErgoHistoryDoctorHistoryLayoutSpec' "$RUNNER_TEMP/defined-tests.txt"
           ./scripts/sbt.sh clean test
 
       - name: Package against Ergo 6.0.6

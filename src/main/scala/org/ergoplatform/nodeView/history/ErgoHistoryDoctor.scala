@@ -205,19 +205,7 @@ object ErgoHistoryDoctor {
     // A diagnostic tool must never silently create a new empty database because the
     // working directory or config path was wrong. Require an existing LevelDB first.
     val historyDir = Paths.get(ergoSettings.directory, "history").toAbsolutePath.normalize
-    require(
-      Files.isDirectory(historyDir),
-      s"History directory does not exist: $historyDir. Refusing to create a new history database; check the node directory/config."
-    )
-    val requiredStores = Seq("index", "objects", "extra")
-    requiredStores.foreach { storeName =>
-      val storeDir = historyDir.resolve(storeName)
-      require(
-        Files.isDirectory(storeDir) && Files.isRegularFile(storeDir.resolve("CURRENT")),
-        s"Existing Ergo LevelDB store was not found at $storeDir (missing directory or CURRENT). " +
-          "Refusing to create/open a new history database."
-      )
-    }
+    requireExistingHistoryLayout(historyDir)
 
     val storage = HistoryStorage(ergoSettings)
 
@@ -237,6 +225,37 @@ object ErgoHistoryDoctor {
       }
 
     Opened(ergoSettings, storage, history, detectRuntimeIdentity())
+  }
+
+  /**
+    * Fail closed before HistoryStorage is constructed.
+    *
+    * HistoryStorage creates missing LevelDB directories, which is appropriate for
+    * the node but dangerous for an offline diagnostic tool: a wrong working
+    * directory could otherwise silently create and inspect a brand-new empty DB.
+    *
+    * This check validates only the expected existing LevelDB layout markers.
+    * It does not claim that the databases themselves are healthy.
+    */
+  private[history] def requireExistingHistoryLayout(historyDir: Path): Unit = {
+    val normalized = historyDir.toAbsolutePath.normalize
+
+    require(
+      Files.isDirectory(normalized),
+      s"History directory does not exist: $normalized. " +
+        "Refusing to create a new history database; check the node directory/config."
+    )
+
+    Seq("index", "objects", "extra").foreach { storeName =>
+      val storeDir = normalized.resolve(storeName)
+      require(
+        Files.isDirectory(storeDir) &&
+          Files.isRegularFile(storeDir.resolve("CURRENT")),
+        s"Existing Ergo LevelDB store was not found at $storeDir " +
+          "(missing directory or CURRENT). " +
+          "Refusing to create/open a new history database."
+      )
+    }
   }
 
   private def detectRuntimeIdentity(): RuntimeIdentity = {
