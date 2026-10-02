@@ -18,7 +18,9 @@ As of **2026-09-28**, Ergo PR [#2548 — Improved repair after DB corruption](ht
 
 ## Safety model
 
-**Stop the Ergo node before running this tool.** History LevelDB must not be open by the node and the doctor at the same time.
+Run `preflight` before opening history. `preflight` is safe to run while the Ergo node may still be running because it does not construct `HistoryStorage` or open LevelDB.
+
+All commands that actually open history require exclusive access to the `index`, `objects`, and `extra` LevelDB stores. If the node or another process holds any of those locks, Ergo History Doctor refuses before opening LevelDB.
 
 The v0.1 repair path deliberately has strict boundaries:
 
@@ -60,12 +62,15 @@ The build helper uses an installed `sbt` if available; otherwise it downloads th
 
 ## First diagnostic pass
 
-With the Ergo node stopped:
+Start with `preflight`. The first command below is safe while the node is running. Run the remaining history-opening commands only after `preflight` reports `offlineOpenAllowed=YES`:
 
 ```powershell
 $jar = 'C:\ERGO\ergo-6.0.6.jar'
 $conf = 'C:\ERGO\ergo.conf'
 
+.\scripts\doctor.ps1 -ErgoJar $jar preflight --config $conf
+
+# After offlineOpenAllowed=YES:
 .\scripts\doctor.ps1 -ErgoJar $jar summary --config $conf
 .\scripts\doctor.ps1 -ErgoJar $jar walk-gap --config $conf
 .\scripts\doctor.ps1 -ErgoJar $jar scan --config $conf --out C:\ERGO\history-scan.tsv

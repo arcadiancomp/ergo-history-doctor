@@ -1,9 +1,10 @@
 package org.ergoplatform.nodeView.history
 
-import java.io.{BufferedInputStream, File, FileInputStream, PrintWriter}
+import java.io.{BufferedInputStream, File, FileInputStream, IOException, PrintWriter}
 import java.net.URI
+import java.nio.channels.{FileChannel, FileLock, OverlappingFileLockException}
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.jar.JarFile
@@ -51,6 +52,7 @@ object ErgoHistoryDoctor {
   private val DefaultBatchHeights = 500
   private val ProgressEvery = 10000
   private val SupportedSections = Set("TX", "AD", "EXT")
+  private val RequiredHistoryStores = Vector("index", "objects", "extra")
 
   final case class Cli(
       command: String,
@@ -66,6 +68,10 @@ object ErgoHistoryDoctor {
       batchHeights: Int,
       sections: Set[String]
   )
+
+  private[history] final case class LockProbe(status: String, detail: String) {
+    def isFree: Boolean = status == "FREE"
+  }
 
   final case class RuntimeIdentity(
       toolVersion: String,
@@ -157,6 +163,11 @@ object ErgoHistoryDoctor {
       val cli = parseCli(args)
       cli.command match {
         case "help" => usage()
+
+        case "preflight" =>
+          require(Files.isRegularFile(cli.config), s"Config file not found: ${cli.config}")
+          preflight(cli.config, cli.network)
+
         case _ =>
           require(Files.isRegularFile(cli.config), s"Config file not found: ${cli.config}")
           withHistory(cli) { opened =>
@@ -197,15 +208,20 @@ object ErgoHistoryDoctor {
     *
     * No state, wallet or mempool database is opened here.
     */
-  private def open(config: Path, network: String): Opened = {
+  private def readSettings(config: Path, network: String): ErgoSettings = {
     val nt = NetworkType.fromString(network).getOrElse(fail(s"Unsupported network: $network"))
-    val ergoSettings = ErgoSettingsReader.read(Args(Some(config.toAbsolutePath.toString), Some(nt)))
+    ErgoSettingsReader.read(Args(Some(config.toAbsolutePath.toString), Some(nt)))
+  }
+
+  private def open(config: Path, network: String): Opened = {
+    val ergoSettings = readSettings(config, network)
 
     // HistoryStorage/ErgoHistory.historyDir will create a missing history directory.
     // A diagnostic tool must never silently create a new empty database because the
     // working directory or config path was wrong. Require an existing LevelDB first.
     val historyDir = Paths.get(ergoSettings.directory, "history").toAbsolutePath.normalize
     requireExistingHistoryLayout(historyDir)
+    requireHistoryStoresUnlocked(historyDir)
 
     val storage = HistoryStorage(ergoSettings)
 
@@ -246,7 +262,7 @@ object ErgoHistoryDoctor {
         "Refusing to create a new history database; check the node directory/config."
     )
 
-    Seq("index", "objects", "extra").foreach { storeName =>
+    RequiredHistoryStores.foreach { storeName =>
       val storeDir = normalized.resolve(storeName)
       require(
         Files.isDirectory(storeDir) &&
@@ -256,6 +272,158 @@ object ErgoHistoryDoctor {
           "Refusing to create/open a new history database."
       )
     }
+  }
+
+  /**
+    * Probe a native LevelDB LOCK file without creating or opening a database.
+    *
+    * FREE means an exclusive OS lock could be acquired and immediately released.
+    * Any other result is treated as unsafe for HistoryStorage to open.
+    */
+  private[history] def probeLevelDbLock(lockFile: Path): LockProbe = {
+    val normalized = lockFile.toAbsolutePath.normalize
+
+    if (!Files.isRegularFile(normalized)) {
+      return LockProbe("MISSING", s"LOCK file does not exist: $normalized")
+    }
+
+    var channel: FileChannel = null
+    var heldLock: FileLock = null
+
+    try {
+      channel = FileChannel.open(
+        normalized,
+        StandardOpenOption.READ,
+        StandardOpenOption.WRITE
+      )
+
+      try {
+        heldLock = channel.tryLock()
+
+        if (heldLock == null) {
+          LockProbe("BUSY", "exclusive OS lock is held by another process")
+        } else {
+          LockProbe("FREE", "exclusive OS lock probe succeeded")
+        }
+      } catch {
+        case _: OverlappingFileLockException =>
+          LockProbe("BUSY", "exclusive OS lock is already held in this JVM")
+
+        case e: IOException =>
+          LockProbe(
+            "BUSY_OR_INACCESSIBLE",
+            s"${e.getClass.getSimpleName}: ${Option(e.getMessage).getOrElse("")}"
+          )
+      }
+    } catch {
+      case e: IOException =>
+        LockProbe(
+          "BUSY_OR_INACCESSIBLE",
+          s"${e.getClass.getSimpleName}: ${Option(e.getMessage).getOrElse("")}"
+        )
+
+      case e: SecurityException =>
+        LockProbe(
+          "INACCESSIBLE",
+          s"${e.getClass.getSimpleName}: ${Option(e.getMessage).getOrElse("")}"
+        )
+    } finally {
+      if (heldLock != null && heldLock.isValid) {
+        Try(heldLock.release())
+      }
+      if (channel != null) {
+        Try(channel.close())
+      }
+    }
+  }
+
+  private[history] def historyLockProbes(
+      historyDir: Path
+  ): Vector[(String, LockProbe)] = {
+    val normalized = historyDir.toAbsolutePath.normalize
+
+    RequiredHistoryStores.map { storeName =>
+      val lockFile = normalized.resolve(storeName).resolve("LOCK")
+      storeName -> probeLevelDbLock(lockFile)
+    }
+  }
+
+  private[history] def requireHistoryStoresUnlocked(historyDir: Path): Unit = {
+    val bad = historyLockProbes(historyDir).filterNot(_._2.isFree)
+
+    require(
+      bad.isEmpty,
+      "Ergo history is not exclusively available. " +
+        "The node or another process may still be using LevelDB: " +
+        bad.map { case (name, probe) =>
+          s"$name=${probe.status} (${probe.detail})"
+        }.mkString("; ")
+    )
+  }
+
+  /**
+    * Safe status command: reads configuration and filesystem/LOCK metadata only.
+    * It deliberately does NOT construct HistoryStorage.
+    */
+  private def preflight(config: Path, network: String): Unit = {
+    val settings = readSettings(config, network)
+    val nodeDir = Paths.get(settings.directory).toAbsolutePath.normalize
+    val historyDir = nodeDir.resolve("history")
+    val runtime = detectRuntimeIdentity()
+
+    println("========================================")
+    println(s"ERGO HISTORY DOCTOR $ToolVersion - PREFLIGHT")
+    println("========================================")
+    println(s"Config file         = ${config.toAbsolutePath.normalize}")
+    println(s"Node directory      = $nodeDir")
+    println(s"History directory   = $historyDir")
+    println(s"Network             = ${settings.networkType.verboseName}")
+    println(s"verifyTransactions  = ${settings.nodeSettings.verifyTransactions}")
+    println(s"stateType           = ${settings.nodeSettings.stateType}")
+    println(s"blocksToKeep        = ${settings.nodeSettings.blocksToKeep}")
+    println(s"Ergo code source    = ${runtime.ergoCodeSource}")
+    println(s"Ergo code SHA-256   = ${runtime.ergoCodeSha256}")
+    println(s"Ergo version hint   = ${runtime.ergoVersionHint}")
+    println()
+
+    val historyExists = Files.isDirectory(historyDir)
+    println(s"history directory   = ${if (historyExists) "Y" else "-"}")
+
+    val probes = RequiredHistoryStores.map { storeName =>
+      val storeDir = historyDir.resolve(storeName)
+      val current = storeDir.resolve("CURRENT")
+      val lockFile = storeDir.resolve("LOCK")
+      val probe = probeLevelDbLock(lockFile)
+
+      println(
+        f"$storeName%-7s CURRENT=${bool(Files.isRegularFile(current))} " +
+          s"LOCK=${bool(Files.isRegularFile(lockFile))} status=${probe.status}"
+      )
+
+      if (!probe.isFree) {
+        println(s"        detail=${probe.detail}")
+      }
+
+      storeName -> probe
+    }
+
+    val layoutOk = Try(requireExistingHistoryLayout(historyDir)).isSuccess
+    val locksFree = probes.forall(_._2.isFree)
+    val safe = layoutOk && locksFree
+
+    println()
+    println(s"layoutValid         = ${if (layoutOk) "YES" else "NO"}")
+    println(s"allHistoryLocksFree = ${if (locksFree) "YES" else "NO"}")
+    println(s"offlineOpenAllowed  = ${if (safe) "YES" else "NO"}")
+    println()
+    println("NO LEVELDB DATABASE WAS OPENED.")
+    println("STATE DATABASE WAS NOT OPENED.")
+
+    require(
+      safe,
+      "Preflight failed: history is not safe for offline opening. " +
+        "Stop the Ergo node/other LevelDB users and correct any missing history files before continuing."
+    )
   }
 
   private def detectRuntimeIdentity(): RuntimeIdentity = {
@@ -1186,9 +1354,12 @@ object ErgoHistoryDoctor {
     println(
       s"""Ergo History Doctor $ToolVersion
          |
-         |The Ergo node MUST be stopped before using this tool.
+         |Run preflight first. It is safe while the Ergo node may still be running.
+         |All commands that open history require exclusive LevelDB locks and will refuse
+         |to run while the node or another process still holds them.
          |
          |Commands:
+         |  preflight --config ergo.conf [--network mainnet]
          |  summary   --config ergo.conf [--network mainnet]
          |  inspect   --config ergo.conf --height N
          |  scan      --config ergo.conf [--from N --to N] [--out report.tsv]
